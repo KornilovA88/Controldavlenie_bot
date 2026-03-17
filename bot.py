@@ -14,6 +14,9 @@ from telegram.ext import (
 )
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+os.environ["TZ"] = "Asia/Novokuznetsk"
+import time
+time.tzset()
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 DB_PATH = os.environ.get("DB_PATH", "bp_diary.db")
