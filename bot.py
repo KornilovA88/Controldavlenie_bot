@@ -124,9 +124,13 @@ async def medication_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def skip_medication(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    try:
+        await q.edit_text(q.message.text, reply_markup=None)
+    except Exception:
+        pass
     context.user_data["medication"] = None
     kb = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_notes")]]
-    await q.edit_text(q.message.text + "\n\n📝 Заметки? Или «Пропустить»", reply_markup=InlineKeyboardMarkup(kb))
+    await q.message.reply_text("📝 Заметки? Или «Пропустить»", reply_markup=InlineKeyboardMarkup(kb))
     return WAITING_NOTES
 
 async def notes_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -136,12 +140,13 @@ async def notes_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def skip_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    try:
+        await q.edit_text(q.message.text, reply_markup=None)
+    except Exception:
+        pass
     context.user_data["notes"] = None
-    return await save_entry(update, context, True)
-
-async def save_entry(update, context, is_cb):
-    data = context.user_data
     uid = update.effective_user.id
+    data = context.user_data
     conn = get_db()
     conn.execute("INSERT INTO entries (user_id,timestamp,systolic,diastolic,pulse,medication,notes) VALUES (?,?,?,?,?,?,?)",
         (uid, datetime.now().isoformat(), data["systolic"], data["diastolic"], data.get("pulse"), data.get("medication"), data.get("notes")))
@@ -152,11 +157,7 @@ async def save_entry(update, context, is_cb):
     med = f"\n💊 {data['medication']}" if data.get("medication") else ""
     notes = f"\n📝 {data['notes']}" if data.get("notes") else ""
     pulse = f"  💓 {data['pulse']}" if data.get("pulse") else ""
-    text = f"✅ *Сохранено!*\n\n🩸 *{data['systolic']}/{data['diastolic']}*{pulse}\n{emoji} {label}{med}{notes}\n\n📊 Всего: {total}"
-    if is_cb:
-        await update.callback_query.edit_text(text, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown")
+    await q.message.reply_text(f"✅ *Сохранено!*\n\n🩸 *{data['systolic']}/{data['diastolic']}*{pulse}\n{emoji} {label}{med}{notes}\n\n📊 Всего: {total}", parse_mode="Markdown")
     context.user_data.clear()
     return ConversationHandler.END
 
