@@ -1,6 +1,3 @@
-Очень странно. Давайте обойдём проблему полностью — встроим установку прямо в bot.py. Тогда не важно, какой builder использует Railway.
-Шаг 1. На GitHub откройте файл bot.py. Нажмите иконку карандаша (Edit). Удалите всё содержимое и вставьте вот это:
-pythonimport subprocess
 import sys
 
 subprocess.check_call([sys.executable, "-m", "pip", "install", "python-telegram-bot==21.6"])
