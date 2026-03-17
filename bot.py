@@ -1,3 +1,4 @@
+import subprocess
 import sys
 
 subprocess.check_call([sys.executable, "-m", "pip", "install", "python-telegram-bot==21.6"])
