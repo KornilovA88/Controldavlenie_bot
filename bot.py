@@ -1,293 +1,137 @@
 import subprocess
 import sys
-
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-    "python-telegram-bot==21.6",
-    "rapidocr-onnxruntime==1.4.4",
-])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "python-telegram-bot==21.6"])
 
 import os
-import re
 import logging
 import sqlite3
 from datetime import datetime, timedelta
 from io import BytesIO
-import tempfile
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes,
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, filters, ContextTypes,
 )
-from rapidocr_onnxruntime import RapidOCR
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 DB_PATH = os.environ.get("DB_PATH", "bp_diary.db")
-ocr_engine = RapidOCR()
-
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
     conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            timestamp TEXT NOT NULL,
-            systolic INTEGER NOT NULL,
-            diastolic INTEGER NOT NULL,
-            pulse INTEGER,
-            medication TEXT,
-            notes TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_user_time
-        ON entries(user_id, timestamp DESC)
-    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, timestamp TEXT NOT NULL, systolic INTEGER NOT NULL, diastolic INTEGER NOT NULL, pulse INTEGER, medication TEXT, notes TEXT)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ut ON entries(user_id, timestamp DESC)")
     conn.commit()
     conn.close()
 
+def classify_bp(s, d):
+    if s < 120 and d < 80: return "🟢", "Оптимальное"
+    if s < 130 and d < 85: return "🟢", "Нормальное"
+    if s < 140 and d < 90: return "🟡", "Повышенное"
+    if s < 160 and d < 100: return "🟠", "Гипертония 1 ст."
+    if s < 180 and d < 110: return "🔴", "Гипертония 2 ст."
+    return "🚨", "Криз!"
 
-def classify_bp(sys_val, dia_val):
-    if sys_val < 120 and dia_val < 80:
-        return "🟢", "Оптимальное"
-    elif sys_val < 130 and dia_val < 85:
-        return "🟢", "Нормальное"
-    elif sys_val < 140 and dia_val < 90:
-        return "🟡", "Повышенное"
-    elif sys_val < 160 and dia_val < 100:
-        return "🟠", "Гипертония 1 ст."
-    elif sys_val < 180 and dia_val < 110:
-        return "🔴", "Гипертония 2 ст."
-    else:
-        return "🚨", "Криз!"
-
-
-def recognize_photo(photo_bytes):
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(photo_bytes)
-        tmp_path = tmp.name
-
-    try:
-        result, _ = ocr_engine(tmp_path)
-        if not result:
-            return {"error": "Не удалось распознать текст на фото"}
-
-        all_text = " ".join([line[1] for line in result])
-        logger.info(f"OCR: {all_text}")
-
-        numbers = [int(n) for n in re.findall(r"\b(\d{2,3})\b", all_text)]
-        logger.info(f"Numbers: {numbers}")
-
-        if not numbers:
-            return {"error": "Не нашёл чисел на фото"}
-
-        seen = set()
-        unique = []
-        for n in numbers:
-            if n not in seen:
-                seen.add(n)
-                unique.append(n)
-
-        if len(unique) < 2:
-            return {"error": "Нашёл мало чисел", "found": unique}
-
-        sorted_nums = sorted(unique, reverse=True)
-        systolic = diastolic = pulse = None
-
-        for n in sorted_nums:
-            if systolic is None and 80 <= n <= 250:
-                systolic = n
-            elif diastolic is None and 40 <= n <= 160 and (systolic is None or n < systolic):
-                diastolic = n
-            elif pulse is None and 35 <= n <= 200 and n != systolic and n != diastolic:
-                pulse = n
-
-        if not systolic or not diastolic:
-            return {"error": "Не удалось определить давление", "found": unique}
-        if systolic <= diastolic:
-            return {"error": f"Верхнее ({systolic}) меньше нижнего ({diastolic})", "found": unique}
-
-        return {"systolic": systolic, "diastolic": diastolic, "pulse": pulse}
-    finally:
-        os.unlink(tmp_path)
-
-
+WAITING_BP_FROM_PHOTO = 10
 WAITING_MEDICATION = 0
 WAITING_NOTES = 1
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️ *Дневник давления*\n\n"
-        "📸 *Отправьте фото тонометра* — распознаю цифры\n"
-        "✏️ *Или введите вручную:* `120/80 72`\n\n"
-        "📋 /history — последние 10 записей\n"
-        "📊 /stats — статистика за неделю\n"
-        "🖨 /export — таблица для печати\n"
-        "❓ /help — справка\n",
-        parse_mode="Markdown",
-    )
-
+        "✏️ Введите: `120/80 72`\n"
+        "📸 Или отправьте фото — бот попросит ввести цифры\n\n"
+        "📋 /history — записи\n"
+        "📊 /stats — статистика\n"
+        "🖨 /export — печать\n"
+        "❓ /help — справка", parse_mode="Markdown")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Как пользоваться:*\n\n"
-        "📸 Отправьте фото экрана тонометра\n"
-        "✏️ Или напишите: `130/85` или `130/85 72`\n\n"
-        "*Команды:*\n"
-        "/history — последние 10 записей\n"
-        "/history\\_all — все записи\n"
-        "/stats — средние за 7 дней\n"
-        "/export — таблица для печати\n"
+        "📖 *Справка:*\n\n"
+        "Напишите давление: `130/85 72`\n"
+        "Или отправьте фото и введите цифры\n\n"
+        "/history — 10 последних\n"
+        "/history\\_all — все\n"
+        "/stats — неделя\n"
+        "/export — таблица\n"
         "/delete — удалить последнюю\n"
-        "/cancel — отменить ввод\n",
-        parse_mode="Markdown",
-    )
-
+        "/cancel — отмена", parse_mode="Markdown")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Ввод отменён.")
+    await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
-
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔍 Распознаю показания...")
+    await update.message.reply_text(
+        "📸 Фото получено!\n\n"
+        "Введите показания с экрана тонометра:\n"
+        "`120/80 72`\n"
+        "(верхнее/нижнее пульс)", parse_mode="Markdown")
+    return WAITING_BP_FROM_PHOTO
 
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    buf = BytesIO()
-    await file.download_to_memory(buf)
-
-    try:
-        result = recognize_photo(buf.getvalue())
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        await msg.edit_text("😕 Ошибка. Введите вручную: `120/80 72`", parse_mode="Markdown")
-        return ConversationHandler.END
-
-    if "error" in result:
-        extra = ""
-        if "found" in result:
-            extra = f"\nНайденные числа: {', '.join(str(n) for n in result['found'])}"
-        await msg.edit_text(f"😕 {result['error']}{extra}\n\nВведите вручную: `120/80 72`", parse_mode="Markdown")
-        return ConversationHandler.END
-
-    sys_val = result["systolic"]
-    dia_val = result["diastolic"]
-    pulse_val = result.get("pulse")
-    emoji, label = classify_bp(sys_val, dia_val)
-
-    context.user_data["systolic"] = sys_val
-    context.user_data["diastolic"] = dia_val
-    context.user_data["pulse"] = pulse_val
-
-    pulse_text = f"\n💓 Пульс: *{pulse_val}*" if pulse_val else ""
-    keyboard = [[
-        InlineKeyboardButton("✅ Верно", callback_data="confirm_ocr"),
-        InlineKeyboardButton("❌ Неверно", callback_data="reject_ocr"),
-    ]]
-
-    await msg.edit_text(
-        f"🔍 Распознано:\n\n🩸 *{sys_val}/{dia_val}*{pulse_text}\n{emoji} {label}\n\nВерно?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return WAITING_MEDICATION
-
-
-async def confirm_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_med")]]
-    await query.edit_text(
-        query.message.text + "\n\n💊 Лекарства? Напишите или «Пропустить»",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return WAITING_MEDICATION
-
-
-async def reject_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data.clear()
-    await query.edit_text("Введите вручную: `120/80 72`", parse_mode="Markdown")
-    return ConversationHandler.END
-
+async def bp_from_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await parse_and_save_bp(update, context)
 
 async def handle_text_bp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await parse_and_save_bp(update, context)
+
+async def parse_and_save_bp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if "/" not in text:
         return ConversationHandler.END
-
     parts = text.replace(",", " ").split()
     try:
         bp = parts[0].split("/")
-        sys_val = int(bp[0].strip())
-        dia_val = int(bp[1].strip())
-        pulse_val = int(parts[1].strip()) if len(parts) > 1 else None
+        s = int(bp[0].strip())
+        d = int(bp[1].strip())
+        p = int(parts[1].strip()) if len(parts) > 1 else None
     except (ValueError, IndexError):
         await update.message.reply_text("🤔 Формат: `120/80` или `120/80 72`", parse_mode="Markdown")
         return ConversationHandler.END
-
-    if sys_val < 60 or sys_val > 300 or dia_val < 30 or dia_val > 200:
+    if s < 60 or s > 300 or d < 30 or d > 200:
         await update.message.reply_text("⚠️ Проверьте давление")
         return ConversationHandler.END
+    if p and (p < 30 or p > 250):
+        await update.message.reply_text("⚠️ Проверьте пульс")
+        return ConversationHandler.END
 
-    emoji, label = classify_bp(sys_val, dia_val)
-    context.user_data["systolic"] = sys_val
-    context.user_data["diastolic"] = dia_val
-    context.user_data["pulse"] = pulse_val
+    emoji, label = classify_bp(s, d)
+    context.user_data["systolic"] = s
+    context.user_data["diastolic"] = d
+    context.user_data["pulse"] = p
 
-    pulse_text = f"\n💓 Пульс: *{pulse_val}*" if pulse_val else ""
-    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_med")]]
-
+    pt = f"\n💓 Пульс: *{p}*" if p else ""
+    kb = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_med")]]
     await update.message.reply_text(
-        f"🩸 *{sys_val}/{dia_val}*{pulse_text}\n{emoji} {label}\n\n💊 Лекарства? Или «Пропустить»",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+        f"🩸 *{s}/{d}*{pt}\n{emoji} {label}\n\n💊 Лекарства? Или «Пропустить»",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     return WAITING_MEDICATION
-
 
 async def medication_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["medication"] = update.message.text.strip()
-    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_notes")]]
-    await update.message.reply_text("📝 Заметки?\nИли «Пропустить»", reply_markup=InlineKeyboardMarkup(keyboard))
+    kb = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_notes")]]
+    await update.message.reply_text("📝 Заметки? Или «Пропустить»", reply_markup=InlineKeyboardMarkup(kb))
     return WAITING_NOTES
-
 
 async def skip_medication(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data["medication"] = None
-    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_notes")]]
-    await q.edit_text(q.message.text + "\n\n📝 Заметки?\nИли «Пропустить»", reply_markup=InlineKeyboardMarkup(keyboard))
+    kb = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_notes")]]
+    await q.edit_text(q.message.text + "\n\n📝 Заметки? Или «Пропустить»", reply_markup=InlineKeyboardMarkup(kb))
     return WAITING_NOTES
-
 
 async def notes_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["notes"] = update.message.text.strip()
     return await save_entry(update, context, False)
-
 
 async def skip_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -295,40 +139,31 @@ async def skip_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["notes"] = None
     return await save_entry(update, context, True)
 
-
-async def save_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback):
+async def save_entry(update, context, is_cb):
     data = context.user_data
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     conn = get_db()
-    conn.execute(
-        "INSERT INTO entries (user_id,timestamp,systolic,diastolic,pulse,medication,notes) VALUES (?,?,?,?,?,?,?)",
-        (user_id, datetime.now().isoformat(), data["systolic"], data["diastolic"],
-         data.get("pulse"), data.get("medication"), data.get("notes")),
-    )
+    conn.execute("INSERT INTO entries (user_id,timestamp,systolic,diastolic,pulse,medication,notes) VALUES (?,?,?,?,?,?,?)",
+        (uid, datetime.now().isoformat(), data["systolic"], data["diastolic"], data.get("pulse"), data.get("medication"), data.get("notes")))
     conn.commit()
-    total = conn.execute("SELECT COUNT(*) as c FROM entries WHERE user_id=?", (user_id,)).fetchone()["c"]
+    total = conn.execute("SELECT COUNT(*) as c FROM entries WHERE user_id=?", (uid,)).fetchone()["c"]
     conn.close()
-
     emoji, label = classify_bp(data["systolic"], data["diastolic"])
     med = f"\n💊 {data['medication']}" if data.get("medication") else ""
     notes = f"\n📝 {data['notes']}" if data.get("notes") else ""
     pulse = f"  💓 {data['pulse']}" if data.get("pulse") else ""
-
     text = f"✅ *Сохранено!*\n\n🩸 *{data['systolic']}/{data['diastolic']}*{pulse}\n{emoji} {label}{med}{notes}\n\n📊 Всего: {total}"
-
-    if is_callback:
+    if is_cb:
         await update.callback_query.edit_text(text, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, parse_mode="Markdown")
-
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     conn = get_db()
-    rows = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp DESC LIMIT 10", (user_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp DESC LIMIT 10", (uid,)).fetchall()
     conn.close()
     if not rows:
         await update.message.reply_text("📋 Нет записей. Введите `120/80`", parse_mode="Markdown")
@@ -336,17 +171,16 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *Последние:*\n"]
     for r in rows:
         dt = datetime.fromisoformat(r["timestamp"])
-        emoji, _ = classify_bp(r["systolic"], r["diastolic"])
+        e, _ = classify_bp(r["systolic"], r["diastolic"])
         p = f" 💓{r['pulse']}" if r["pulse"] else ""
         m = " 💊" if r["medication"] else ""
-        lines.append(f"{emoji} `{dt.strftime('%d.%m %H:%M')}` *{r['systolic']}/{r['diastolic']}*{p}{m}")
+        lines.append(f"{e} `{dt.strftime('%d.%m %H:%M')}` *{r['systolic']}/{r['diastolic']}*{p}{m}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def history_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     conn = get_db()
-    rows = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp DESC", (user_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp DESC", (uid,)).fetchall()
     conn.close()
     if not rows:
         await update.message.reply_text("📋 Нет записей.")
@@ -354,19 +188,18 @@ async def history_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *Все:*\n"]
     for r in rows:
         dt = datetime.fromisoformat(r["timestamp"])
-        emoji, _ = classify_bp(r["systolic"], r["diastolic"])
+        e, _ = classify_bp(r["systolic"], r["diastolic"])
         p = f" 💓{r['pulse']}" if r["pulse"] else ""
-        lines.append(f"{emoji} `{dt.strftime('%d.%m.%y %H:%M')}` *{r['systolic']}/{r['diastolic']}*{p}")
+        lines.append(f"{e} `{dt.strftime('%d.%m.%y %H:%M')}` *{r['systolic']}/{r['diastolic']}*{p}")
     text = "\n".join(lines)
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
 
-
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    uid = update.effective_user.id
+    wa = (datetime.now() - timedelta(days=7)).isoformat()
     conn = get_db()
-    rows = conn.execute("SELECT * FROM entries WHERE user_id=? AND timestamp>=?", (user_id, week_ago)).fetchall()
+    rows = conn.execute("SELECT * FROM entries WHERE user_id=? AND timestamp>=?", (uid, wa)).fetchall()
     conn.close()
     if not rows:
         await update.message.reply_text("📊 Нет данных за неделю.")
@@ -382,16 +215,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(sv) >= 3:
         h = len(sv)//2
         f_, s_ = sum(sv[:h])/h, sum(sv[h:])/(len(sv)-h)
-        tr = "\n📉 *снижается*" if s_ < f_-3 else ("\n📈 *растёт*" if s_ > f_+3 else "\n➡️ *стабильно*")
+        tr = "\n📉 *снижается*" if s_<f_-3 else ("\n📈 *растёт*" if s_>f_+3 else "\n➡️ *стабильно*")
     await update.message.reply_text(
-        f"📊 *7 дней* ({len(rows)} зап.)\n\n🩸 Среднее: *{a_s:.0f}/{a_d:.0f}*\n{emoji} {label}{pl}\n⬆️ *{max(sv)}/{max(dv)}*  ⬇️ *{min(sv)}/{min(dv)}*{tr}",
+        f"📊 *7 дней* ({len(rows)})\n\n🩸 *{a_s:.0f}/{a_d:.0f}*\n{emoji} {label}{pl}\n⬆️ *{max(sv)}/{max(dv)}*  ⬇️ *{min(sv)}/{min(dv)}*{tr}",
         parse_mode="Markdown")
 
-
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     conn = get_db()
-    rows = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp", (user_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp", (uid,)).fetchall()
     conn.close()
     if not rows:
         await update.message.reply_text("📋 Нет записей.")
@@ -407,13 +239,12 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = BytesIO(html.encode())
     buf.name = f"bp_{datetime.now().strftime('%Y%m%d')}.html"
     buf.seek(0)
-    await update.message.reply_document(document=buf, filename=buf.name, caption="🖨 Браузер → Ctrl+P → Печать")
-
+    await update.message.reply_document(document=buf, filename=buf.name, caption="🖨 Браузер → Ctrl+P")
 
 async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     conn = get_db()
-    row = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,)).fetchone()
+    row = conn.execute("SELECT * FROM entries WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (uid,)).fetchone()
     if not row:
         await update.message.reply_text("📋 Нет записей.")
         conn.close()
@@ -422,7 +253,6 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text(f"🗑 Удалено: {row['systolic']}/{row['diastolic']}")
-
 
 def main():
     init_db()
@@ -433,9 +263,10 @@ def main():
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_bp),
         ],
         states={
+            WAITING_BP_FROM_PHOTO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bp_from_photo),
+            ],
             WAITING_MEDICATION: [
-                CallbackQueryHandler(confirm_ocr, pattern="^confirm_ocr$"),
-                CallbackQueryHandler(reject_ocr, pattern="^reject_ocr$"),
                 CallbackQueryHandler(skip_medication, pattern="^skip_med$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, medication_text),
             ],
@@ -456,7 +287,6 @@ def main():
     app.add_handler(conv)
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
