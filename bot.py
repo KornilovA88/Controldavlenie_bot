@@ -257,7 +257,7 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    conv = ConversationHandler(
+      conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.PHOTO, handle_photo),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_bp),
@@ -275,7 +275,11 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, notes_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(skip_medication, pattern="^skip_med$"),
+            CallbackQueryHandler(skip_notes, pattern="^skip_notes$"),
+        ],
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
